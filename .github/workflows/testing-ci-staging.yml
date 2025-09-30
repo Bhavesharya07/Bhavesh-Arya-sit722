@@ -1,0 +1,151 @@
+name: CI on testing -> Test, Push to ACR, Temp Staging
+
+on:
+  push:
+    branches: [ testing ]
+
+env:
+  LOCATION: ${{ secrets.LOCATION }}
+  RG_BASE: ${{ secrets.RG_BASE }}
+  RG_STAGING: ${{ secrets.RG_STAGING }}
+  ACR_NAME: ${{ secrets.ACR_NAME }}
+  ACR_LOGIN_SERVER: ${{ secrets.ACR_LOGIN_SERVER }}
+
+jobs:
+  build-test-push:
+    name: Build, Test, and Push images
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - svc_name: "customer_service"
+            context: "backend/customer_service"
+            type: "python"
+          - svc_name: "order_service"
+            context: "backend/order_service"
+            type: "python"
+          - svc_name: "product_service"
+            context: "backend/product_service"
+            type: "python"
+          - svc_name: "frontend"
+            context: "frontend"
+            type: "static"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # ---------- TESTS ----------
+      - name: Set up Python (for python services)
+        if: matrix.type == 'python'
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install deps
+        if: matrix.type == 'python'
+        working-directory: ${{ matrix.context }}
+        run: |
+          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+          if [ -f requirements-dev.txt ]; then pip install -r requirements-dev.txt; fi
+          pip install pytest
+
+      - name: Run pytest
+        if: matrix.type == 'python'
+        run: |
+          if [ -d "${{ matrix.context }}/tests" ]; then
+            pytest -q "${{ matrix.context }}/tests"
+          else
+            echo "No tests for ${{ matrix.svc_name }}. Skipping."
+          fi
+
+      # ---------- BUILD & PUSH ----------
+      - name: Azure login
+        uses: azure/login@v2
+        with:
+          auth-type: service-principal
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          client-secret: ${{ secrets.AZURE_CLIENT_SECRET }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: ACR login
+        run: az acr login --name $ACR_NAME
+
+      - name: Build and Push Docker image
+        id: buildpush
+        run: |
+          IMG_SHA_TAG=${{ github.sha }}
+          IMAGE="$ACR_LOGIN_SERVER/${{ matrix.svc_name }}:$IMG_SHA_TAG"
+          docker build -t "$IMAGE" "${{ matrix.context }}"
+          docker push "$IMAGE"
+          LATEST="$ACR_LOGIN_SERVER/${{ matrix.svc_name }}:latest"
+          docker tag "$IMAGE" "$LATEST"
+          docker push "$LATEST"
+          echo "image=$IMAGE" >> $GITHUB_OUTPUT
+
+  staging-ephemeral:
+    name: Create TEMP staging (ACI), smoke-test, destroy
+    runs-on: ubuntu-latest
+    needs: build-test-push
+    steps:
+      - name: Azure login
+        uses: azure/login@v2
+        with:
+          auth-type: service-principal
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          client-secret: ${{ secrets.AZURE_CLIENT_SECRET }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Ensure staging RG exists
+        run: az group create -n $RG_STAGING -l $LOCATION
+
+      - name: Get ACR pull credentials for ACI
+        id: acr
+        run: |
+          USER=$(az acr credential show -n $ACR_NAME --query username -o tsv)
+          PASS=$(az acr credential show -n $ACR_NAME --query passwords[0].value -o tsv)
+          echo "user=$USER" >> $GITHUB_OUTPUT
+          echo "pass=$PASS" >> $GITHUB_OUTPUT
+
+      - name: Compose FE image tag
+        run: echo "IMAGE=$ACR_LOGIN_SERVER/frontend:${{ github.sha }}" >> $GITHUB_ENV
+
+      - name: Create ACI container group
+        run: |
+          DNS="sit722-staging-${{ github.run_number }}"
+          az container create \
+            -g $RG_STAGING \
+            -n sit722-staging \
+            --image "$IMAGE" \
+            --cpu 1 --memory 1 \
+            --registry-login-server $ACR_LOGIN_SERVER \
+            --registry-username "${{ steps.acr.outputs.user }}" \
+            --registry-password "${{ steps.acr.outputs.pass }}" \
+            --ports 80 \
+            --dns-name-label $DNS \
+            -l $LOCATION
+
+      - name: Wait for container to be Running
+        run: |
+          for i in {1..24}; do
+            STATE=$(az container show -g $RG_STAGING -n sit722-staging --query instanceView.state -o tsv)
+            echo "State: $STATE"
+            if [ "$STATE" = "Running" ]; then break; fi
+            sleep 10
+          done
+
+      - name: Smoke test (HTTP 200 on /)
+        run: |
+          FQDN=$(az container show -g $RG_STAGING -n sit722-staging --query ipAddress.fqdn -o tsv)
+          echo "FQDN=$FQDN"
+          curl -i --max-time 20 "http://$FQDN/" | tee curl_out.txt
+          if ! grep -q " 200 " curl_out.txt; then
+            echo "Smoke test failed (non-200)."
+            exit 1
+          fi
+
+      - name: Destroy TEMP staging RG (always)
+        if: always()
+        run: az group delete -n $RG_STAGING -y --no-wait
